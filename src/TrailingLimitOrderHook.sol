@@ -19,6 +19,7 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 
+/// @notice Specifies trailing limit percentages represented in ticks.
 enum TrailLimitChoice {
     ONE_PERCENT,
     FIVE_PERCENT,
@@ -28,28 +29,26 @@ enum TrailLimitChoice {
 }
 
 library TrailLimitChoiceLib {
-    // We store the tick equivalent of the trailing percentage
-    // Each tick represents ~0.01% (1 basis point)
-    // since p(i) = 1.0001^i; if p(i) = 1.01 (1% increase), then i = log(1.01) / log(1.0001) ~= 99 ticks
-    // Apporximately, each 100 ticks represent 1% price movement
+    // Approximate tick equivalents for trailing percentages
     int24 internal constant BP_ONE_PERCENT = 100;
     int24 internal constant BP_FIVE_PERCENT = 490;
     int24 internal constant BP_TEN_PERCENT = 950;
-    int24 internal constant BP_FIFTEEN_PERCENT = 1_400;
-    int24 internal constant BP_TWENTY_PERCENT = 1_800;
+    int24 internal constant BP_FIFTEEN_PERCENT = 1400;
+    int24 internal constant BP_TWENTY_PERCENT = 1800;
 
-    function asTickDiff(TrailLimitChoice choice) internal pure returns (int24) {
+    /// @notice Converts TrailLimitChoice enum to equivalent tick difference
+    function asTickDiff(TrailLimitChoice choice) public pure returns (int24) {
         if (choice == TrailLimitChoice.ONE_PERCENT) return BP_ONE_PERCENT;
         if (choice == TrailLimitChoice.FIVE_PERCENT) return BP_FIVE_PERCENT;
         if (choice == TrailLimitChoice.TEN_PERCENT) return BP_TEN_PERCENT;
         if (choice == TrailLimitChoice.FIFTEEN_PERCENT) return BP_FIFTEEN_PERCENT;
         if (choice == TrailLimitChoice.TWENTY_PERCENT) return BP_TWENTY_PERCENT;
-        revert("Unknown TrailPctChoice");
+        revert("Unknown TrailLimitChoice");
     }
 }
 
-/// @title Trailing Limit Order Hook
-/// @notice Allows users to place trailing limit and market orders on Uniswap v4 pools.
+/// @title Trailing Limit Order Hook for Uniswap V4 Pools
+/// @notice Enables trailing limit and market orders with tick-based thresholds.
 contract TrailingLimitOrderHook is BaseHook, ERC1155 {
     using StateLibrary for IPoolManager;
     using FixedPointMathLib for uint256;
@@ -58,13 +57,16 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
     using PoolIdLibrary for PoolKey;
     using TrailLimitChoiceLib for TrailLimitChoice;
 
+    // Custom type for tracking orders
     type TrailOrderId is bytes32;
 
-    // ERRORS
+    // Errors
     error InvalidOrder();
     error NothingToClaim();
     error NotEnoughToClaim();
+    error NotOrderOwner();
 
+    /// @notice Order types: Limit or Market (not fully implemented, only trailing limit)
     enum OrderType {
         LIMIT,
         MARKET
@@ -73,43 +75,52 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
     struct TrailOrder {
         address sender;
         int24 initialTick;
-        uint256 inputAmount; // Ensure it's always a positive amount
-        OrderType orderType;
+        uint256 inputAmount;
         TrailLimitChoice trailPctIndex;
         bool zeroForOne;
         uint256 expiryTimestamp;
     }
 
     struct TrailState {
-        int24 priceChangeTick;
+        int24 priceChangeTick; // Reference tick (peak or trough)
         bool isInitialized;
-        bool isDownward; // Did Token0 price increase
+        bool isDownward; // True if price dropped from peak
     }
 
-    mapping(PoolId poolId => mapping(bool zeroForOne => mapping(TrailLimitChoice trailLimit => TrailOrder[]))) public
-        userTrailFees;
+    /// @dev Pool trail state keyed by PoolId
+    mapping(PoolId => TrailState) public poolTrailStates;
 
-    mapping(PoolId poolId => TrailState) public poolTrailStates;
-    mapping(PoolId poolId => mapping(bool zeroForOne => mapping(TrailLimitChoice trailLimit => TrailOrder[]))) public
+    /// @dev Pending trail orders by PoolId, swap direction, trail choice, and index
+    mapping(PoolId => mapping(bool => mapping(TrailLimitChoice => mapping(uint8 => TrailOrder)))) public
         pendingTrailOrders;
 
-    mapping(PoolId poolId => mapping(int24 tickToSellAt => mapping(bool zeroForOne => uint256 inputAmount))) public
-        pendingLimitOrders;
+    /// @dev Rotating index per PoolId, direction, and trail choice for new orders (0-255)
+    mapping(PoolId => mapping(bool => mapping(TrailLimitChoice => uint8))) public poolTrailOrderIndexes;
 
-    //
-    mapping(uint256 orderId => uint256 claimsSupply) public claimTokensSupply;
-    mapping(uint256 orderId => uint256 outputClaimable) public claimableOutputTokens;
+    /// @dev Pending limit orders (not fully utilized here)
+    mapping(PoolId => mapping(int24 => mapping(bool => uint256))) public pendingLimitOrders;
 
-    mapping(PoolId poolId => int24 lastTick) public lastTicks;
+    /// @dev Track claim token supplies per orderId
+    mapping(uint256 => uint256) public claimTokensSupply;
 
+    /// @dev Claimable output tokens per orderId
+    mapping(uint256 => uint256) public claimableOutputTokens;
+
+    /// @dev Last observed tick per pool
+    mapping(PoolId => int24) public lastTicks;
+
+    // Events
     event OrderPlaced(
         bytes32 indexed orderId, address indexed owner, bool indexed zeroForOne, uint128 size, int24 trailTicks
     );
-    event OrderExecuted(bytes32 indexed orderId, address indexed owner, uint128 executedSize, int24 executionTick);
+    event OrderExecuted(bytes32 indexed orderId, uint128 executedSize, int24 executionTick);
     event OrderCancelled(bytes32 indexed orderId);
 
+    /// @param _poolManager Address of the pool manager contract
+    /// @param _uri Metadata URI for ERC1155 tokens
     constructor(IPoolManager _poolManager, string memory _uri) BaseHook(_poolManager) ERC1155(_uri) {}
 
+    /// @notice Hook permissions specifying enabled callback hooks
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
@@ -129,12 +140,15 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
         });
     }
 
+    /// @inheritdoc BaseHook
     function _afterInitialize(address, PoolKey calldata key, uint160, int24 tick) internal override returns (bytes4) {
-        lastTicks[key.toId()] = tick;
-        poolTrailStates[key.toId()] = TrailState({priceChangeTick: tick, isInitialized: true, isDownward: false});
+        PoolId poolId = key.toId();
+        lastTicks[poolId] = tick;
+        poolTrailStates[poolId] = TrailState({priceChangeTick: tick, isInitialized: true, isDownward: false});
         return this.afterInitialize.selector;
     }
 
+    /// @inheritdoc BaseHook
     function _afterSwap(address sender, PoolKey calldata key, SwapParams calldata params, BalanceDelta, bytes calldata)
         internal
         override
@@ -142,112 +156,50 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
     {
         if (sender == address(this)) return (this.afterSwap.selector, 0);
 
-        (, int24 currentTick,,) = poolManager.getSlot0(key.toId());
-        int24 lastTick = lastTicks[key.toId()];
-        TrailState memory state = poolTrailStates[key.toId()];
+        PoolId poolId = key.toId();
+        (, int24 currentTick,,) = poolManager.getSlot0(poolId);
+        TrailState memory state = poolTrailStates[poolId];
 
         if (!state.isInitialized) return (this.afterSwap.selector, 0);
 
-        bool wasDownward = state.isDownward;
-
-        // UPDATE TRAIL STATE CORRECTLY
+        // Update trail state depending on price peak or trough changes
         if (currentTick > state.priceChangeTick) {
-            // New high: reset peak, clear downward state
-            poolTrailStates[key.toId()] = TrailState({
-                priceChangeTick: currentTick,
-                isInitialized: true,
-                isDownward: false // Token0 price ↑ from trough
-            });
+            // New peak price
+            poolTrailStates[poolId] =
+                TrailState({priceChangeTick: currentTick, isInitialized: true, isDownward: false});
         } else if (currentTick < state.priceChangeTick) {
-            // New low: set downward flag (Token0 price ↓ from peak)
-            poolTrailStates[key.toId()] = TrailState({
-                priceChangeTick: state.priceChangeTick, // Keep peak
-                isInitialized: true,
-                isDownward: true
-            });
+            // Price dropped from peak, set downward flag
+            poolTrailStates[poolId] =
+                TrailState({priceChangeTick: state.priceChangeTick, isInitialized: true, isDownward: true});
         }
 
-        // EXECUTE TRAILS FIRST
         tryExecutingTrailOrders(key, params.zeroForOne);
 
-        // THEN LIMITS
-        bool tryMore = true;
-        int24 swapTick;
-        while (tryMore) {
-            (tryMore, swapTick) = tryExecutingLimitOrders(key, !params.zeroForOne);
-        }
-
-        // ALWAYS UPDATE WITH ACTUAL POOL TICK
-        lastTicks[key.toId()] = currentTick; // FIXED: use actual currentTick
+        lastTicks[poolId] = currentTick;
         return (this.afterSwap.selector, 0);
     }
 
-    function tryExecutingTrailOrders(PoolKey calldata key, bool executeZeroForOne)
-        internal
-        returns (bool tryMore, int24 newTick)
-    {
-        (, int24 currentTick,,) = poolManager.getSlot0(key.toId());
-        TrailState memory state = poolTrailStates[key.toId()];
+    /// @notice Main execution logic - reduced stack depth by splitting processing
+    function tryExecutingTrailOrders(PoolKey calldata key, bool executeZeroForOne) internal returns (bool, int24) {
+        PoolId poolId = key.toId();
+        (, int24 currentTick,,) = poolManager.getSlot0(poolId);
+        TrailState memory state = poolTrailStates[poolId];
+
         if (!state.isInitialized) return (false, currentTick);
 
         int24 priceBaseline = state.priceChangeTick;
         int24 tickDistance = currentTick > priceBaseline ? currentTick - priceBaseline : priceBaseline - currentTick;
-
-        uint256 orderId = getOrderId(key, currentTick, executeZeroForOne);
         uint256 totalMarketInput;
 
-        // Loop over all trail choices efficiently
+        uint256 orderId = getOrderId(key, currentTick, executeZeroForOne);
+
+        // Split the loop into smaller chunks to reduce stack depth
         for (uint8 choiceIdx = 0; choiceIdx <= uint8(TrailLimitChoice.TWENTY_PERCENT); choiceIdx++) {
             TrailLimitChoice choice = TrailLimitChoice(choiceIdx);
-            int24 threshold = choice.asTickDiff();
+            if (tickDistance < choice.asTickDiff()) continue;
 
-            if (tickDistance < threshold) continue;
-
-            TrailOrder[] storage orders = pendingTrailOrders[key.toId()][executeZeroForOne][choice];
-            for (uint256 i = orders.length; i > 0;) {
-                unchecked {
-                    --i;
-                }
-                TrailOrder memory order = orders[i];
-
-                // EXPIRY CHECK
-                if (block.timestamp > order.expiryTimestamp) {
-                    orders[i] = orders[orders.length - 1];
-                    orders.pop();
-                    continue;
-                }
-
-                bool shouldExecute;
-                if (state.isDownward) {
-                    // STOP LOSS: price dropped from peak
-                    shouldExecute = (executeZeroForOne && currentTick <= order.initialTick)
-                        || (!executeZeroForOne && currentTick >= order.initialTick);
-                } else {
-                    // TAKE PROFIT: price rose from trough
-                    shouldExecute = (executeZeroForOne && currentTick >= order.initialTick)
-                        || (!executeZeroForOne && currentTick <= order.initialTick);
-                }
-
-                if (!shouldExecute) continue;
-
-                if (order.inputAmount == 0) {
-                    orders[i] = orders[orders.length - 1];
-                    orders.pop();
-                    continue;
-                }
-
-                // EXECUTE ORDER
-                if (order.orderType == OrderType.MARKET) {
-                    totalMarketInput += order.inputAmount;
-                } else {
-                    claimTokensSupply[orderId] += order.inputAmount;
-                }
-                _mint(order.sender, orderId, order.inputAmount, "");
-
-                // REMOVE EXECUTED ORDER
-                orders[i] = orders[orders.length - 1];
-                orders.pop();
-            }
+            uint256 choiceInput = processChoiceOrders(poolId, choice, executeZeroForOne, currentTick, orderId);
+            totalMarketInput += choiceInput;
         }
 
         if (totalMarketInput > 0) {
@@ -257,64 +209,99 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
         return (false, currentTick);
     }
 
-    function tryExecutingLimitOrders(PoolKey calldata key, bool executeZeroForOne)
-        internal
-        returns (bool tryMore, int24 newTick)
-    {
-        (, int24 currentTick,,) = poolManager.getSlot0(key.toId());
-        int24 lastTick = lastTicks[key.toId()];
+    /// @notice Process orders for a specific trail choice - isolated to reduce stack depth
+    function processChoiceOrders(
+        PoolId poolId,
+        TrailLimitChoice choice,
+        bool zeroForOne,
+        int24 currentTick,
+        uint256 orderId
+    ) internal returns (uint256 totalInput) {
+        mapping(uint8 => TrailOrder) storage orders = pendingTrailOrders[poolId][zeroForOne][choice];
 
-        // If tick has increased (currentTick > lastTick)
-        // Token0 price increases
-        if (currentTick > lastTick) {
-            // Loop over all ticks from lastTick to currentTick
-            // and execute orders for token0 (zeroForOne = false)
-            for (int24 tick = lastTick; tick < currentTick; tick += key.tickSpacing) {
-                uint256 inputAmount = pendingLimitOrders[key.toId()][tick][executeZeroForOne];
-                if (inputAmount > 0) {
-                    executeLimitOrder(key, tick, executeZeroForOne, inputAmount);
-                    return (true, currentTick);
-                }
+        for (uint8 i = 0; i < 256; i++) {
+            if (processSingleOrder(orders, i, poolId, zeroForOne, currentTick, orderId)) {
+                totalInput += orders[i].inputAmount;
             }
         }
-        // If tick has decreased (currentTick < lastTick)
-        // Token1 price increases
-        else {
-            for (int24 tick = lastTick; tick > currentTick; tick -= key.tickSpacing) {
-                uint256 inputAmount = pendingLimitOrders[key.toId()][tick][executeZeroForOne];
-                if (inputAmount > 0) {
-                    executeLimitOrder(key, tick, executeZeroForOne, inputAmount);
-                    return (true, currentTick);
-                }
-            }
-        }
-
-        // No orders to execute
-        return (false, currentTick);
     }
 
+    /// @notice Process single order - minimal stack usage
+    function processSingleOrder(
+        mapping(uint8 => TrailOrder) storage orders,
+        uint8 index,
+        PoolId poolId,
+        bool zeroForOne,
+        int24 currentTick,
+        uint256 orderId
+    ) internal returns (bool executed) {
+        TrailOrder storage order = orders[index];
+        if (order.inputAmount == 0) return false;
+
+        // Expiry check first (cheap)
+        if (block.timestamp > order.expiryTimestamp) {
+            delete orders[index];
+            return false;
+        }
+
+        TrailState memory state = poolTrailStates[poolId];
+        if (!_shouldExecuteOrder(state.isDownward, currentTick, order.initialTick, zeroForOne)) {
+            return false;
+        }
+
+        // Execute order
+        claimTokensSupply[orderId] += order.inputAmount;
+        _mint(order.sender, orderId, order.inputAmount, "");
+        delete orders[index];
+        return true;
+    }
+
+    /// @notice Ultra-lightweight execution condition - 4 params only
+    function _shouldExecuteOrder(bool isDownward, int24 currentTick, int24 initialTick, bool zeroForOne)
+        private
+        pure
+        returns (bool)
+    {
+        if (isDownward) {
+            // STOP LOSS
+            return (zeroForOne && currentTick <= initialTick) || (!zeroForOne && currentTick >= initialTick);
+        }
+        // TAKE PROFIT
+        return (zeroForOne && currentTick >= initialTick) || (!zeroForOne && currentTick <= initialTick);
+    }
+
+    /// @notice Returns the nearest usable tick below the given tick respecting tick spacing
     function getLowerUsableTick(int24 tick, int24 tickSpacing) private pure returns (int24) {
         int24 intervals = tick / tickSpacing;
 
-        // Solidity truncates towards zero on integer division
-        // With negative numbers it means we need to subtract one more interval
+        // Solidity truncates towards zero for int division, handle negatives correctly
         if (tick < 0 && tick % tickSpacing != 0) {
             intervals--;
         }
-
         return intervals * tickSpacing;
     }
 
+    /// @notice Computes an order ID from the pool key, tick, and swap direction
+    /// @param key Pool key for the order
+    /// @param tick Tick associated with the order
+    /// @param zeroForOne Swap direction (token0 to token1)
+    /// @return Unique order ID
     function getOrderId(PoolKey calldata key, int24 tick, bool zeroForOne) public pure returns (uint256) {
         return uint256(keccak256(abi.encodePacked(key.toId(), tick, zeroForOne)));
     }
 
+    /// @notice Place a new trailing limit order with specified parameters
+    /// @param key Pool to place order in
+    /// @param initialTick Tick at placement time (price baseline)
+    /// @param inputAmount Amount of input tokens for the order
+    /// @param trailPct Trailing percentage choice
+    /// @param zeroForOne Direction of swap desired
+    /// @return orderId Unique ID for the placed order (as bytes32)
     function placeTrailOrder(
         PoolKey calldata key,
+        int24 initialTick,
         uint256 inputAmount,
-        OrderType orderType,
         TrailLimitChoice trailPct,
-        uint256 expirySecondsFromNow,
         bool zeroForOne
     ) external returns (bytes32 orderId) {
         if (inputAmount == 0) revert InvalidOrder();
@@ -323,15 +310,17 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
 
         TrailOrder memory order = TrailOrder({
             sender: msg.sender,
-            initialTick: currentTick,
+            initialTick: initialTick,
             inputAmount: inputAmount,
-            orderType: orderType,
             trailPctIndex: trailPct,
             zeroForOne: zeroForOne,
-            expiryTimestamp: block.timestamp + expirySecondsFromNow
+            expiryTimestamp: block.timestamp + 12 hours
         });
 
-        pendingTrailOrders[key.toId()][zeroForOne][trailPct].push(order);
+        PoolId poolId = key.toId();
+        uint8 orderIndx = poolTrailOrderIndexes[poolId][zeroForOne][trailPct];
+        pendingTrailOrders[poolId][zeroForOne][trailPct][orderIndx] = order;
+        poolTrailOrderIndexes[poolId][zeroForOne][trailPct] = uint8((orderIndx + 1) % 256);
 
         address inputToken = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
         IERC20(inputToken).safeTransferFrom(msg.sender, address(this), inputAmount);
@@ -340,44 +329,43 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
         emit OrderPlaced(orderId, msg.sender, zeroForOne, uint128(inputAmount), trailPct.asTickDiff());
     }
 
-    function placeLimitOrder(PoolKey calldata key, int24 tickToSellAt, bool zeroForOne, uint256 inputAmount)
-        external
-        returns (int24)
-    {
-        int24 tick = getLowerUsableTick(tickToSellAt, key.tickSpacing);
+    /// @notice Cancel a pending trailing order partially or fully
+    /// @param key Pool of the order
+    /// @param zeroForOne Direction of the order
+    /// @param trailPct Trailing percentage tier of the order
+    /// @param orderIndx Index of order in storage
+    /// @param amountToCancel Amount to cancel and refund
+    function cancelOrder(
+        PoolKey calldata key,
+        bool zeroForOne,
+        TrailLimitChoice trailPct,
+        uint8 orderIndx,
+        uint256 amountToCancel
+    ) external {
+        PoolId poolId = key.toId();
+        TrailOrder storage order = pendingTrailOrders[poolId][zeroForOne][trailPct][orderIndx];
+        uint256 orderIdNum = getOrderId(key, lastTicks[poolId], zeroForOne);
 
-        pendingLimitOrders[key.toId()][tick][zeroForOne] += inputAmount;
-
-        uint256 orderId = getOrderId(key, tick, zeroForOne);
-        claimTokensSupply[orderId] += inputAmount;
-        _mint(msg.sender, orderId, inputAmount, "");
-
-        address sellToken = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
-        IERC20(sellToken).safeTransferFrom(msg.sender, address(this), inputAmount);
-
-        return tick;
-    }
-
-    function cancelLimitOrder(PoolKey calldata key, int24 tickToSellAt, bool zeroForOne, uint256 amountToCancel)
-        external
-    {
-        int24 tick = getLowerUsableTick(tickToSellAt, key.tickSpacing);
-        uint256 orderId = getOrderId(key, tick, zeroForOne);
-
-        if (balanceOf(msg.sender, orderId) < amountToCancel) {
+        if (amountToCancel == 0 || order.inputAmount < amountToCancel) {
             revert NotEnoughToClaim();
         }
+        if (msg.sender != order.sender) {
+            revert NotOrderOwner();
+        }
 
-        pendingLimitOrders[key.toId()][tick][zeroForOne] -= amountToCancel;
-        claimTokensSupply[orderId] -= amountToCancel;
-        _burn(msg.sender, orderId, amountToCancel);
+        order.inputAmount -= amountToCancel;
 
-        address sellToken = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
-        IERC20(sellToken).safeTransfer(msg.sender, amountToCancel);
+        address refundToken = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
+        IERC20(refundToken).safeTransfer(msg.sender, amountToCancel);
 
-        emit OrderCancelled(bytes32(orderId));
+        emit OrderCancelled(bytes32(orderIdNum));
     }
 
+    /// @notice Redeem by burning claim tokens for output tokens after order execution
+    /// @param key Pool key related to order
+    /// @param tickToSellAt Tick at which order was executed
+    /// @param zeroForOne Swap direction
+    /// @param inputAmountToClaimFor Amount of claim tokens to redeem
     function redeem(PoolKey calldata key, int24 tickToSellAt, bool zeroForOne, uint256 inputAmountToClaimFor)
         external
     {
@@ -402,18 +390,16 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
         IERC20(token).safeTransfer(msg.sender, outputAmount);
     }
 
+    /// @notice Execute an aggregated market order from multiple trailing orders
+    /// @param key Pool key
+    /// @param tick Current tick at execution
+    /// @param zeroForOne Swap direction
+    /// @param inputAmount Total input amount to swap
     function executeMarketOrder(PoolKey calldata key, int24 tick, bool zeroForOne, uint256 inputAmount) internal {
         _executeOrder(key, tick, zeroForOne, inputAmount);
     }
 
-    function executeLimitOrder(PoolKey calldata key, int24 tick, bool zeroForOne, uint256 inputAmount) internal {
-        _executeOrder(key, tick, zeroForOne, inputAmount);
-        pendingLimitOrders[key.toId()][tick][zeroForOne] -= inputAmount;
-        if (pendingLimitOrders[key.toId()][tick][zeroForOne] == 0) {
-            delete pendingLimitOrders[key.toId()][tick][zeroForOne];
-        }
-    }
-
+    /// @dev Internal call to perform swap and update balances accordingly
     function _executeOrder(PoolKey calldata key, int24 tick, bool zeroForOne, uint256 inputAmount) internal {
         BalanceDelta delta = swapAndSettleBalances(
             key,
@@ -431,6 +417,7 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
         emit OrderExecuted(bytes32(orderId), uint128(inputAmount), lastTicks[key.toId()]);
     }
 
+    /// @dev Helper to perform swap and settle token balances to or from pool manager
     function swapAndSettleBalances(PoolKey calldata key, SwapParams memory params) internal returns (BalanceDelta) {
         BalanceDelta delta = poolManager.swap(key, params, "");
 
@@ -438,7 +425,6 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
             if (delta.amount0() < 0) {
                 _settle(key.currency0, uint128(-delta.amount0()));
             }
-
             if (delta.amount1() > 0) {
                 _take(key.currency1, uint128(delta.amount1()));
             }
@@ -446,7 +432,6 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
             if (delta.amount1() < 0) {
                 _settle(key.currency1, uint128(-delta.amount1()));
             }
-
             if (delta.amount0() > 0) {
                 _take(key.currency0, uint128(delta.amount0()));
             }
@@ -454,12 +439,14 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
         return delta;
     }
 
+    /// @dev Settle tokens owed to pool manager by transferring tokens
     function _settle(Currency currency, uint128 amount) internal {
         poolManager.sync(currency);
         currency.transfer(address(poolManager), amount);
         poolManager.settle();
     }
 
+    /// @dev Take tokens from pool manager into this contract
     function _take(Currency currency, uint128 amount) internal {
         poolManager.take(currency, address(this), amount);
     }
