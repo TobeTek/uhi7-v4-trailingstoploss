@@ -12,9 +12,7 @@ import {TrailingLimitOrderHook} from "../src/TrailingLimitOrderHook.sol";
 contract DeployHookScript is BaseScript {
     function run() public {
         // hook contracts must have specific flags encoded in the address
-        uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG
-        );
+        uint160 flags = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG);
         string memory hookURI = "https://metadata.example.com/{id}.json";
 
         // Mine a salt that will produce a hook address with the correct flags

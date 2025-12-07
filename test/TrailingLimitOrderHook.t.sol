@@ -23,7 +23,7 @@ import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 
 import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 
-import {TrailingLimitOrderHook } from "../src/TrailingLimitOrderHook.sol";
+import {TrailingLimitOrderHook} from "../src/TrailingLimitOrderHook.sol";
 
 contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
     // Use the libraries
@@ -39,29 +39,17 @@ contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
         deployMintAndApprove2Currencies();
 
         // Deploy our hook
-        uint160 flags = uint160(
-            Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG
-        );
+        uint160 flags = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG);
         address hookAddress = address(flags);
-        deployCodeTo(
-            "TrailingLimitOrderHook.sol",
-            abi.encode(manager, ""),
-            hookAddress
-        );
+        deployCodeTo("TrailingLimitOrderHook.sol", abi.encode(manager, ""), hookAddress);
         hook = TrailingLimitOrderHook(hookAddress);
 
         // Approve our hook address to spend these tokens as well
-        MockERC20(Currency.unwrap(currency0)).approve(
-            address(hook),
-            type(uint256).max
-        );
-        MockERC20(Currency.unwrap(currency1)).approve(
-            address(hook),
-            type(uint256).max
-        );
+        MockERC20(Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
+        MockERC20(Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
 
         // Initialize a pool with these two tokens
-        (key, ) = initPool(currency0, currency1, hook, 3000, SQRT_PRICE_1_1);
+        (key,) = initPool(currency0, currency1, hook, 3000, SQRT_PRICE_1_1);
 
         // Add initial liquidity to the pool
         modifyLiquidityRouter.modifyLiquidity(
@@ -156,27 +144,21 @@ contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
             sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
         });
 
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
-            .TestSettings({takeClaims: false, settleUsingBurn: false});
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
         // Conduct the swap - `afterSwap` should also execute our placed order
         swapRouter.swap(key, params, testSettings, ZERO_BYTES);
 
         // Check that the order has been executed
         // by ensuring no amount is left to sell in the pending orders
-        uint256 pendingTokensForPosition = hook.pendingOrders(
-            key.toId(),
-            tick,
-            zeroForOne
-        );
+        uint256 pendingTokensForPosition = hook.pendingOrders(key.toId(), tick, zeroForOne);
         assertEq(pendingTokensForPosition, 0);
 
         // Check that the hook contract has the expected number of currency1 tokens ready to redeem
         uint256 orderId = hook.getOrderId(key, tickLower, zeroForOne);
         uint256 claimableOutputTokens = hook.claimableOutputTokens(orderId);
-        uint256 hookContractcurrency1Balance = currency1.balanceOf(
-            address(hook)
-        );
+        uint256 hookContractcurrency1Balance = currency1.balanceOf(address(hook));
         assertEq(claimableOutputTokens, hookContractcurrency1Balance);
 
         // Ensure we can redeem the currency1 tokens
@@ -184,10 +166,7 @@ contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
         hook.redeem(key, tick, zeroForOne, amount);
         uint256 newcurrency1Balance = currency1.balanceOf(address(this));
 
-        assertEq(
-            newcurrency1Balance - originalcurrency1Balance,
-            claimableOutputTokens
-        );
+        assertEq(newcurrency1Balance - originalcurrency1Balance, claimableOutputTokens);
     }
 
     function test_orderExecute_oneForZero() public {
@@ -200,31 +179,22 @@ contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
 
         // Do a separate swap from zeroForOne to make tick go down
         // Sell 1e18 currency0 tokens for currency1 tokens
-        SwapParams memory params = SwapParams({
-            zeroForOne: true,
-            amountSpecified: -1 ether,
-            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-        });
+        SwapParams memory params =
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1});
 
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
-            .TestSettings({takeClaims: false, settleUsingBurn: false});
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
         swapRouter.swap(key, params, testSettings, ZERO_BYTES);
 
         // Check that the order has been executed
-        uint256 tokensLeftToSell = hook.pendingOrders(
-            key.toId(),
-            tick,
-            zeroForOne
-        );
+        uint256 tokensLeftToSell = hook.pendingOrders(key.toId(), tick, zeroForOne);
         assertEq(tokensLeftToSell, 0);
 
         // Check that the hook contract has the expected number of currency0 tokens ready to redeem
         uint256 orderId = hook.getOrderId(key, tickLower, zeroForOne);
         uint256 claimableOutputTokens = hook.claimableOutputTokens(orderId);
-        uint256 hookContractcurrency0Balance = currency0.balanceOf(
-            address(hook)
-        );
+        uint256 hookContractcurrency0Balance = currency0.balanceOf(address(hook));
         assertEq(claimableOutputTokens, hookContractcurrency0Balance);
 
         // Ensure we can redeem the currency0 tokens
@@ -232,15 +202,12 @@ contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
         hook.redeem(key, tick, zeroForOne, amount);
         uint256 newcurrency0Balance = currency0.balanceOfSelf();
 
-        assertEq(
-            newcurrency0Balance - originalcurrency0Balance,
-            claimableOutputTokens
-        );
+        assertEq(newcurrency0Balance - originalcurrency0Balance, claimableOutputTokens);
     }
 
     function test_multiple_orderExecute_zeroForOne_onlyOne() public {
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
-            .TestSettings({takeClaims: false, settleUsingBurn: false});
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
         // Setup two zeroForOne orders at ticks 0 and 60
         uint256 amount = 0.01 ether;
@@ -248,15 +215,12 @@ contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
         hook.placeOrder(key, 0, true, amount);
         hook.placeOrder(key, 180, true, amount);
 
-        (, int24 currentTick, , ) = manager.getSlot0(key.toId());
+        (, int24 currentTick,,) = manager.getSlot0(key.toId());
         assertEq(currentTick, 0);
 
         // Do a swap to make tick increase beyond 180
-        SwapParams memory params = SwapParams({
-            zeroForOne: false,
-            amountSpecified: -0.1 ether,
-            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
-        });
+        SwapParams memory params =
+            SwapParams({zeroForOne: false, amountSpecified: -0.1 ether, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1});
 
         swapRouter.swap(key, params, testSettings, ZERO_BYTES);
 
@@ -274,8 +238,8 @@ contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
     }
 
     function test_multiple_orderExecute_zeroForOne_both() public {
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
-            .TestSettings({takeClaims: false, settleUsingBurn: false});
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
         // Setup two zeroForOne orders at ticks 0 and 60
         uint256 amount = 0.01 ether;
@@ -284,11 +248,8 @@ contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
         hook.placeOrder(key, 60, true, amount);
 
         // Do a swap to make tick increase
-        SwapParams memory params = SwapParams({
-            zeroForOne: false,
-            amountSpecified: -0.5 ether,
-            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
-        });
+        SwapParams memory params =
+            SwapParams({zeroForOne: false, amountSpecified: -0.5 ether, sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1});
 
         swapRouter.swap(key, params, testSettings, ZERO_BYTES);
 
