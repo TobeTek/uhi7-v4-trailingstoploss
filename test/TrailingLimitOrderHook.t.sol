@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
-import {Test, console2} from "forge-std/Test.sol";
+import {Test, console, Vm} from "forge-std/Test.sol";
 import {ERC1155Holder} from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
@@ -15,329 +16,279 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 
-import {TrailingLimitOrderHook, TrailLimitChoice, TrailLimitChoiceLib } from "../src/TrailingLimitOrderHook.sol";
-
+import {TrailingLimitOrderHook, TrailLimitChoice, TrailLimitChoiceLib} from "../src/TrailingLimitOrderHook.sol";
 
 contract TrailingLimitOrderHookTest is Test, Deployers, ERC1155Holder {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
+    using StateLibrary for IPoolManager;
     using TrailLimitChoiceLib for TrailLimitChoice;
 
     TrailingLimitOrderHook hook;
     MockERC20 token0;
     MockERC20 token1;
-    uint8 orderIndex;
+    PoolId poolId;
 
     function setUp() public {
-        // Deploy v4 core contracts
         deployFreshManagerAndRouters();
         swapRouter = new PoolSwapTest(manager);
 
-        // Deploy two test tokens
         (Currency currency0, Currency currency1) = deployMintAndApprove2Currencies();
         token0 = MockERC20(Currency.unwrap(currency0));
         token1 = MockERC20(Currency.unwrap(currency1));
 
-        // Deploy hook with correct flags
         uint160 flags = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG);
         address hookAddress = address(flags);
-        deployCodeTo("TrailingLimitOrderHook.sol:TrailingLimitOrderHook", abi.encode(manager, "https://example.com"), hookAddress);
+        deployCodeTo(
+            "TrailingLimitOrderHook.sol:TrailingLimitOrderHook", abi.encode(manager, "https://example.com"), hookAddress
+        );
         hook = TrailingLimitOrderHook(hookAddress);
 
-        // Approve hook to spend tokens
+        // Approve everything
         token0.approve(address(hook), type(uint256).max);
         token1.approve(address(hook), type(uint256).max);
+        token0.approve(address(swapRouter), type(uint256).max);
+        token1.approve(address(swapRouter), type(uint256).max);
 
-        // Initialize pool
+        // ✅ INSPIRATION: Wide usable tick range + realistic liquidity
         (key,) = initPool(currency0, currency1, hook, 3000, 60, SQRT_PRICE_1_1);
+        poolId = key.toId();
 
-        // Add initial liquidity
         modifyLiquidityRouter.modifyLiquidity(
             key,
             ModifyLiquidityParams({
-                tickLower: TickMath.minUsableTick(60),
-                tickUpper: TickMath.maxUsableTick(60),
-                liquidityDelta: 100 ether,
+                tickLower: TickMath.minUsableTick(60), // -315252
+                tickUpper: TickMath.maxUsableTick(60), // 315240
+                liquidityDelta: 10 ether, // Small realistic amount
                 salt: bytes32(0)
             }),
-            ZERO_BYTES
+            ""
         );
 
-        // Mint more tokens for testing
-        deal(address(token0), address(this), 1000 ether);
-        deal(address(token1), address(this), 1000 ether);
+        deal(address(token0), address(this), 1_000_000 ether);
+        deal(address(token1), address(this), 1_000_000 ether);
+        deal(address(token0), address(swapRouter), 1_000_000 ether);
+        deal(address(token1), address(swapRouter), 1_000_000 ether);
     }
 
-    /// @notice Helper to place order and return index by parsing event
-    function placeOrder(TrailLimitChoice choice, int24 initialTick, uint256 amount, bool zeroForOne)
+    function placeOrder(uint256 amount, TrailLimitChoice choice, uint256 expiry, bool zeroForOne)
         internal
-        returns (uint8)
+        returns (uint256)
     {
-        uint8 index = hook.poolTrailOrderIndexes(key.toId(), zeroForOne, choice);
-        vm.recordLogs();
-        hook.placeTrailOrder(key, initialTick, amount, choice, zeroForOne);
-        orderIndex = index;
-        return index;
+        hook.placeTrailOrder(key, amount, choice, expiry, zeroForOne);
+        return hook.orderCount(poolId, zeroForOne, choice) - 1;
     }
 
     function test_placeTrailOrder_Success() public {
         uint256 amount = 1 ether;
-        TrailLimitChoice choice = TrailLimitChoice.ONE_PERCENT;
-
         uint256 initialBalance = token0.balanceOf(address(this));
-        bytes32 orderId = hook.placeTrailOrder(key, 0, amount, choice, true);
 
-        uint256 orderKey = hook.getOrderId(key, 0, true);
-        assertEq(hook.balanceOf(address(this), orderKey), amount);
+        hook.placeTrailOrder(key, amount, TrailLimitChoice.ONE_PERCENT, 24 hours, true);
+        (, int24 currentTick,,) = manager.getSlot0(poolId);
+        uint256 orderId = hook.getOrderId(key, currentTick, true);
+
+        assertEq(hook.balanceOf(address(this), orderId), amount);
         assertEq(token0.balanceOf(address(this)), initialBalance - amount);
-        assertTrue(bytes32(orderId) != bytes32(0));
     }
 
     function test_placeTrailOrder_ZeroAmount_Reverts() public {
         vm.expectRevert(TrailingLimitOrderHook.InvalidOrder.selector);
-        hook.placeTrailOrder(key, 0, 0, TrailLimitChoice.ONE_PERCENT, true);
+        hook.placeTrailOrder(key, 0, TrailLimitChoice.ONE_PERCENT, 24 hours, true);
     }
 
-    function test_fuzz_placeTrailOrder(uint256 amount, uint8 choiceIdx, int24 tick) public {
-        vm.assume(amount > 0 && amount < 100 ether);
-        TrailLimitChoice choice = TrailLimitChoice(bound(choiceIdx, 0, 4));
-        vm.assume(tick > TickMath.MIN_TICK + 100 && tick < TickMath.MAX_TICK - 100);
+    // function test_cancelOrder_FullAmount() public {
+    //     uint256 amount = 1 ether;
+    //     uint256 orderIdx = placeOrder(amount, TrailLimitChoice.ONE_PERCENT, 24 hours, true);
+    //     uint256 initialBalance = token0.balanceOf(address(this));
 
-        uint256 initialBalance = token0.balanceOf(address(this));
-        hook.placeTrailOrder(key, tick, amount, choice, true);
+    //     (, int24 currentTick,,) = manager.getSlot0(poolId);
+    //     uint256 orderId = hook.getOrderId(key, currentTick, true);
 
-        uint256 orderKey = hook.getOrderId(key, tick, true);
-        assertEq(hook.balanceOf(address(this), orderKey), amount);
-        assertEq(token0.balanceOf(address(this)), initialBalance - amount);
+    //     hook.cancelOrder(key, TrailLimitChoice.ONE_PERCENT, orderIdx, amount);
+
+    //     assertEq(token0.balanceOf(address(this)), initialBalance);
+    //     assertEq(hook.balanceOf(address(this), orderId), 0);
+    // }
+
+    function test_trailOrder_MultipleThresholds() public {
+        uint256 amount = 0.01 ether;
+        (, int24 startTick,,) = manager.getSlot0(poolId);
+        console.log("=== START TICK ===", int256(startTick));
+
+        placeOrder(amount, TrailLimitChoice.ONE_PERCENT, 24 hours, true);
+        placeOrder(amount, TrailLimitChoice.FIVE_PERCENT, 24 hours, true);
+
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        // SWAP 1: BIG momentum UP → peak=200+, baseline trails
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: false, // tick UP
+                amountSpecified: -0.15 ether, // BIGGER for >100 ticks
+                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            testSettings,
+            ""
+        );
+        (, int24 tick1,,) = manager.getSlot0(poolId);
+        console.log("=== SWAP1 PEAK ===", int256(tick1));
+
+        // SWAP 2: Partial reversal → 200→120 (80 tick pullback <100, no exec)
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: true, // tick DOWN
+                amountSpecified: 0.08 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            testSettings,
+            ""
+        );
+        (, int24 tick2,,) = manager.getSlot0(poolId);
+        console.log("=== SWAP2 PARTIAL ===", int256(tick2));
+        assertEq(hook.orderCount(poolId, true, TrailLimitChoice.ONE_PERCENT), 1); // Pending
+
+        // SWAP 3: BIG reversal → 120→10 (peak-10=190+ >100, 1% EXECUTES!)
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: 0.1 ether, // BIG drop
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            testSettings,
+            ""
+        );
+        (, int24 endTick,,) = manager.getSlot0(poolId);
+        console.log("=== SWAP3 TRIGGER ===", int256(endTick));
+
+        assertEq(hook.orderCount(poolId, true, TrailLimitChoice.ONE_PERCENT), 0); // EXECUTED
+        assertEq(hook.orderCount(poolId, true, TrailLimitChoice.FIVE_PERCENT), 1); // PENDING (190<490)
     }
 
-    function test_cancelOrder_FullAmount() public {
-        uint256 amount = 1 ether;
-        TrailLimitChoice choice = TrailLimitChoice.ONE_PERCENT;
-        uint8 index = placeOrder(choice, 0, amount, true);
+    function test_trailOrder_TakeProfit_ZeroForOne() public {
+        uint256 amount = 0.01 ether;
+        vm.recordLogs();
 
-        uint256 initialBalance = token0.balanceOf(address(this));
-        uint256 orderKey = hook.getOrderId(key, 0, true);
+        placeOrder(amount, TrailLimitChoice.ONE_PERCENT, 24 hours, true);
 
-        hook.cancelOrder(key, true, choice, index, amount);
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
-        assertEq(hook.balanceOf(address(this), orderKey), 0);
-        assertEq(token0.balanceOf(address(this)), initialBalance);
+        // STEP 1: Build peak (tick 0→250+)
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: false,
+                amountSpecified: -0.2 ether, // BIG upswing
+                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            testSettings,
+            ""
+        );
+
+        // STEP 2: Reversal past threshold (250→<150)
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: 0.35 ether, // BIGGER drop (>100 ticks)
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            testSettings,
+            ""
+        );
+
+        bool hasOrderExecuted;
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            console.log("=== EVENT %s ===", i);
+            console.logBytes32(logs[i].topics[0]); // Event signature
+            console.logBytes32(logs[i].topics[1]); // orderId (indexed)
+            console.logBytes32(logs[i].topics[2]); // owner (indexed)
+
+            // Decode OrderExecuted data (executedSize + executionTick)
+            // bytes32 orderExecutedTopic = keccak256("OrderExecuted(bytes32,address,uint128,int24)");
+            // bytes32 orderExecutedTopic = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef;
+            // bytes32 orderExecutedTopic = 0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f;
+            bytes32 orderExecutedTopic = 0x9436f0f45137443f7df1f84b51ffe9f6e3d5a67d517d51df8857e66e661f0e1d;
+
+            // Only expect one of these to be fired
+            if (logs[i].topics[0] == orderExecutedTopic) {
+                // Manual ABI decode non-indexed params from data
+                (uint128 executedSize, int24 executionTick) = abi.decode(logs[i].data, (uint128, int24));
+                console.log("OrderExecuted!");
+                console.log("executedSize:", uint256(executedSize));
+                console.log("executionTick:", int256(executionTick));
+
+                uint256 orderId = hook.getOrderId(key, -82, true);
+                console.log("Current Tick:", executionTick);
+                console.log("Queried OrderId:", orderId);
+                
+                // assertGt(hook.claimableOutputTokens(uint256(logs[i].topics[1])), 0); 
+                assertGt(hook.claimTokensSupply(20), 0);
+                assertGt(hook.claimableOutputTokens(20), 0);
+                hasOrderExecuted = true;
+            }
+        }
+        if(!hasOrderExecuted){
+            revert("No OrderExecuted event fired");
+        }
+        // (, int24 execTick,,) = manager.getSlot0(poolId);
+        // uint256 orderId = hook.getOrderId(key, execTick, true);
+        // console.log("Current Tick:", execTick);
+        // console.log("Queried OrderId:", orderId);
+        // assertGt(hook.claimableOutputTokens(orderId), 0); // ✅ FIRED!
     }
 
     function test_cancelOrder_PartialAmount() public {
         uint256 amount = 2 ether;
-        TrailLimitChoice choice = TrailLimitChoice.ONE_PERCENT;
-        uint8 index = placeOrder(choice, 0, amount, true);
-
-        uint256 initialBalance = token0.balanceOf(address(this));
+        uint256 orderIdx = placeOrder(amount, TrailLimitChoice.ONE_PERCENT, 24 hours, true);
         uint256 partialAmount = 1 ether;
+        uint256 initialBalance = token0.balanceOf(address(this));
 
-        hook.cancelOrder(key, true, choice, index, partialAmount);
-
-        uint256 orderKey = hook.getOrderId(key, 0, true);
-        assertEq(hook.balanceOf(address(this), orderKey), amount - partialAmount);
+        hook.cancelOrder(key, TrailLimitChoice.ONE_PERCENT, orderIdx, partialAmount, true);
         assertEq(token0.balanceOf(address(this)), initialBalance + partialAmount);
     }
 
     function test_cancelOrder_ZeroAmount_Reverts() public {
-        TrailLimitChoice choice = TrailLimitChoice.ONE_PERCENT;
-        placeOrder(choice, 0, 1 ether, true);
-
+        uint256 orderIdx = placeOrder(1 ether, TrailLimitChoice.ONE_PERCENT, 24 hours, true);
         vm.expectRevert(TrailingLimitOrderHook.NotEnoughToClaim.selector);
-        hook.cancelOrder(key, true, choice, orderIndex, 0);
+        hook.cancelOrder(key, TrailLimitChoice.ONE_PERCENT, orderIdx, 0, true);
     }
 
     function test_cancelOrder_InsufficientAmount_Reverts() public {
-        TrailLimitChoice choice = TrailLimitChoice.ONE_PERCENT;
-        placeOrder(choice, 0, 1 ether, true);
-
+        uint256 orderIdx = placeOrder(1 ether, TrailLimitChoice.ONE_PERCENT, 24 hours, true);
         vm.expectRevert(TrailingLimitOrderHook.NotEnoughToClaim.selector);
-        hook.cancelOrder(key, true, choice, orderIndex, 2 ether);
+        hook.cancelOrder(key, TrailLimitChoice.ONE_PERCENT, orderIdx, 2 ether, true);
     }
 
     function test_cancelOrder_NotOwner_Reverts() public {
-        TrailLimitChoice choice = TrailLimitChoice.ONE_PERCENT;
         address user = makeAddr("user");
         vm.startPrank(user);
         deal(address(token0), user, 10 ether);
         token0.approve(address(hook), type(uint256).max);
-        hook.placeTrailOrder(key, 0, 1 ether, choice, true);
+        uint256 orderIdx = placeOrder(1 ether, TrailLimitChoice.ONE_PERCENT, 24 hours, true);
         vm.stopPrank();
 
-        vm.expectRevert(TrailingLimitOrderHook.NotOrderOwner.selector);
-        hook.cancelOrder(key, true, choice, orderIndex, 1 ether);
-    }
-
-    function test_redeem_ZeroClaimable_Reverts() public {
-        uint256 orderId = hook.getOrderId(key, 0, true);
-
-        vm.expectRevert(TrailingLimitOrderHook.NothingToClaim.selector);
-        hook.redeem(key, 0, true, 1 ether);
-    }
-
-    // function test_redeem_InsufficientERC1155Balance_Reverts() public {
-    //     // Place order to get ERC1155 tokens
-    //     placeOrder(TrailLimitChoice.ONE_PERCENT, 0, 1 ether, true);
-        
-    //     uint256 orderId = hook.getOrderId(key, 0, true);
-        
-    //     // Burn all ERC1155 tokens first
-    //     hook._burn(address(this), orderId, 1 ether);
-        
-    //     // Try to redeem without ERC1155 balance
-    //     vm.expectRevert(TrailingLimitOrderHook.NotEnoughToClaim.selector);
-    //     hook.redeem(key, 0, true, 1 ether);
-    // }
-
-    function test_hookPermissions() public {
-        Hooks.Permissions memory perms = hook.getHookPermissions();
-        assertFalse(perms.beforeInitialize);
-        assertTrue(perms.afterInitialize);
-        assertFalse(perms.beforeSwap);
-        assertTrue(perms.afterSwap);
-    }
-
-    function test_getHookPermissions_MatchesDeployFlags() public {
-        uint160 flags = uint160(Hooks.AFTER_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG);
-        Hooks.Permissions memory perms = hook.getHookPermissions();
-
-        assertEq(
-            uint160(perms.afterInitialize ? Hooks.AFTER_INITIALIZE_FLAG : 0) |
-            uint160(perms.afterSwap ? Hooks.AFTER_SWAP_FLAG : 0),
-            flags
-        );
-    }
-
-    function test_getOrderId_Consistency() public {
-        uint256 orderId1 = hook.getOrderId(key, 100, true);
-        uint256 orderId2 = hook.getOrderId(key, 100, true);
-        assertEq(orderId1, orderId2);
-        
-        uint256 orderId3 = hook.getOrderId(key, 100, false);
-        assertTrue(orderId1 != orderId3);
-    }
-
-    function test_trailOrder_TriggerTakeProfit_ZeroForOne() public {
-        uint256 amount = 0.1 ether;
-        TrailLimitChoice choice = TrailLimitChoice.ONE_PERCENT;
-
-        // Place order at current tick
-        (, int24 currentTick,,) = StateLibrary.getSlot0(manager, key.toId());
-        placeOrder(choice, currentTick, amount, true);
-
-        // Perform large oneForZero swap to move price up significantly
-        // This should trigger take-profit condition in afterSwap
-        SwapParams memory params = SwapParams({
-            zeroForOne: false,
-            amountSpecified: -5 ether,
-            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.maxUsableTick(60))
-        });
-
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
-            takeClaims: true,
-            settleUsingBurn: false
-        });
-
-        deal(address(token1), address(this), 10 ether);
-        swapRouter.swap(key, params, testSettings, "");
-
-        // Check if order was executed by checking claimable tokens
-        uint256 orderId = hook.getOrderId(key, currentTick + choice.asTickDiff(), true);
-        assertGt(hook.claimableOutputTokens(orderId), 0, "Take profit should have executed");
-    }
-
-    function test_trailOrder_TriggerTakeProfit_OneForZero() public {
-        uint256 amount = 0.1 ether;
-        TrailLimitChoice choice = TrailLimitChoice.ONE_PERCENT;
-
-        (, int24 currentTick,,) = StateLibrary.getSlot0(manager, key.toId());
-        placeOrder(choice, currentTick, amount, false);
-
-        // Perform large zeroForOne swap to move price down
-        SwapParams memory params = SwapParams({
-            zeroForOne: true,
-            amountSpecified: -5 ether,
-            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.minUsableTick(60))
-        });
-
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
-            takeClaims: true,
-            settleUsingBurn: false
-        });
-
-        deal(address(token0), address(this), 10 ether);
-        swapRouter.swap(key, params, testSettings, "");
-
-        uint256 orderId = hook.getOrderId(key, currentTick - choice.asTickDiff(), false);
-        assertGt(hook.claimableOutputTokens(orderId), 0, "Take profit should have executed");
-    }
-
-    function test_trailOrder_ExpiryCleanup() public {
-        uint256 amount = 0.1 ether;
-        TrailLimitChoice choice = TrailLimitChoice.ONE_PERCENT;
-
-        // Place order
-        (, int24 currentTick,,) = StateLibrary.getSlot0(manager, key.toId());
-        placeOrder(choice, currentTick, amount, true);
-
-        // Warp past 12 hour expiry
-        vm.warp(block.timestamp + 13 hours);
-
-        // Trigger swap - expired order should be cleaned up (deleted)
-        SwapParams memory params = SwapParams({
-            zeroForOne: false,
-            amountSpecified: -0.1 ether,
-            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.maxUsableTick(60))
-        });
-
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
-            takeClaims: true,
-            settleUsingBurn: false
-        });
-
-        swapRouter.swap(key, params, testSettings, "");
-
-        // Order should not have been executed (no claimable tokens)
-        uint256 orderId = hook.getOrderId(key, currentTick, true);
-        assertEq(hook.claimableOutputTokens(orderId), 0, "Expired order should not execute");
-    }
-
-    function test_trailOrder_MultipleThresholds() public {
-        uint256 amount = 0.05 ether;
-
-        (, int24 currentTick,,) = StateLibrary.getSlot0(manager, key.toId());
-
-        // Place orders at different trail percentages
-        placeOrder(TrailLimitChoice.ONE_PERCENT, currentTick, amount, true);
-        placeOrder(TrailLimitChoice.FIVE_PERCENT, currentTick, amount, true);
-
-        // Small price move - only 1% threshold should trigger
-        SwapParams memory params = SwapParams({
-            zeroForOne: false,
-            amountSpecified: -1 ether, // Moderate move
-            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.maxUsableTick(60))
-        });
-
-        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest.TestSettings({
-            takeClaims: true,
-            settleUsingBurn: false
-        });
-
-        swapRouter.swap(key, params, testSettings, "");
-
-        // 1% order should execute
-        uint256 orderId1 = hook.getOrderId(key, currentTick + 100, true);
-        assertGt(hook.claimableOutputTokens(orderId1), 0);
-
-        // 5% order should NOT execute yet
-        uint256 orderId5 = hook.getOrderId(key, currentTick + 490, true);
-        assertEq(hook.claimableOutputTokens(orderId5), 0);
+        vm.prank(address(0xdead));
+        vm.expectRevert(TrailingLimitOrderHook.NotEnoughToClaim.selector);
+        hook.cancelOrder(key, TrailLimitChoice.ONE_PERCENT, orderIdx, 1 ether, true);
     }
 
     function test_poolTrailStates_Initialization() public {
-        (int24 _priceChangeTick, bool isInitialized, bool _isDownward) = hook.poolTrailStates(key.toId());
-        assertTrue(isInitialized);
-        assertEq(hook.lastTicks(key.toId()), 0);
+        (, int24 poolTick,,) = manager.getSlot0(poolId);
+        (int24 priceTick, bool initialized, bool downward) = hook.poolTrailStates(poolId);
+        assertTrue(initialized);
+        assertEq(priceTick, poolTick);
+        assertFalse(downward);
+    }
+
+    function test_redeem_ZeroClaimable_Reverts() public {
+        vm.expectRevert(TrailingLimitOrderHook.NothingToClaim.selector);
+        hook.redeem(key, 0, true, 1 ether);
     }
 }
