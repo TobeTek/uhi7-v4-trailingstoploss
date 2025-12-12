@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: SEE LICENSE IN LICENSE
 pragma solidity ^0.8.0;
 
-import {console} from "forge-std/Test.sol";
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
 import {ERC1155} from "openzeppelin/token/ERC1155/ERC1155.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
@@ -45,8 +44,6 @@ library TrailLimitChoiceLib {
     }
 }
 
-/// @title Fixed Trailing Limit Order Hook for Uniswap V4
-/// @notice Production-ready trailing stop/take-profit orders
 contract TrailingLimitOrderHook is BaseHook, ERC1155 {
     using StateLibrary for IPoolManager;
     using FixedPointMathLib for uint256;
@@ -84,7 +81,6 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
     mapping(PoolId => TrailState) public poolTrailStates;
     mapping(PoolId => int24) public lastTicks;
 
-    // FIXED: Keep original name for test compatibility + add input tracking
     mapping(uint256 => uint256) public claimTokensSupply;
     mapping(uint256 => uint256) public claimableOutputTokens;
 
@@ -97,10 +93,7 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
     event OrderExecuted(bytes32 indexed orderId, address indexed owner, uint128 executedSize, int24 executionTick);
     event OrderCancelled(bytes32 indexed orderId, address indexed owner, uint128 cancelledAmount);
 
-    constructor(IPoolManager _poolManager, string memory _uri) BaseHook(_poolManager) ERC1155(_uri) {
-        claimTokensSupply[20] = 90;
-        claimableOutputTokens[20] = 90;
-    }
+    constructor(IPoolManager _poolManager, string memory _uri) BaseHook(_poolManager) ERC1155(_uri) {}
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
@@ -162,7 +155,6 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
         PoolId poolId = key.toId();
         (, int24 currentTick,,) = poolManager.getSlot0(poolId);
 
-        // ✅ FIXED: Use TRAILING PEAK distance (state.priceChangeTick - currentTick)
         int24 trailingDistance = state.priceChangeTick > currentTick
             ? state.priceChangeTick - currentTick
             : currentTick - state.priceChangeTick;
@@ -213,7 +205,6 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
 
         if (!isFavorableReversal) return false;
 
-        // ✅ ACTUAL SWAP EXECUTION
         address inputToken = zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
         IERC20(inputToken).approve(address(poolManager), order.inputAmount);
 
@@ -223,37 +214,18 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
             sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
         });
 
-        // ✅ GET EXECUTION TICK FROM SWAP RESULT
         BalanceDelta delta = swapAndSettleBalances(key, swapParams);
-        (, int24 executionTick,,) = poolManager.getSlot0(key.toId()); // POST-SWAP TICK!
+        (, int24 executionTick,,) = poolManager.getSlot0(key.toId());
 
-        // ✅ USE EXECUTION TICK FOR orderId
         uint256 orderId = getOrderId(key, executionTick, zeroForOne);
-
-        // Track REAL swap output
         uint256 outputAmount = zeroForOne ? uint128(-delta.amount1()) : uint128(-delta.amount0());
 
-        // claimTokensSupply[20] += order.inputAmount;
-        // claimableOutputTokens[20] += outputAmount;
-        // claimableOutputTokens[orderId] += outputAmount;
+        claimTokensSupply[orderId] += order.inputAmount;
+        claimableOutputTokens[orderId] += outputAmount;
 
-        claimTokensSupply[20] = 9000;
-        claimableOutputTokens[20] = 9000;
-
-        claimTokensSupply[20] += 5000;
-        claimableOutputTokens[20] += 5000;
-        claimableOutputTokens[orderId] += 5000;
-        
-        console.log("orderId: ", uint256(orderId));
-
-        // Burn input NFT, mint output NFT with execution tick
         uint256 inputNftId = getOrderId(key, order.initialTick, zeroForOne);
         _burn(order.sender, inputNftId, order.inputAmount);
         _mint(order.sender, orderId, outputAmount, "");
-
-        console.log("SWAP EXECUTED at tick:", int256(executionTick));
-        console.log("input:", uint256(order.inputAmount), "output:", outputAmount);
-        
 
         emit OrderExecuted(bytes32(orderId), order.sender, uint128(outputAmount), executionTick);
         delete pendingTrailOrders[poolId][zeroForOne][choice][orderIndex];
@@ -322,6 +294,10 @@ contract TrailingLimitOrderHook is BaseHook, ERC1155 {
         TrailOrder storage order = pendingTrailOrders[poolId][zeroForOne][trailPct][orderIdx];
 
         if (amountToCancel == 0 || order.inputAmount < amountToCancel || order.sender != msg.sender) {
+            revert NotEnoughToClaim();
+        }
+
+        if (order.inputAmount == 0) {
             revert NotEnoughToClaim();
         }
 
